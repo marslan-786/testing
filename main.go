@@ -5,24 +5,36 @@ import (
 	"net/http"
 	"os"
 
-	"myproject/dgroup"
 	"github.com/gin-gonic/gin"
+	"myproject/dgroup"
 )
 
 func main() {
 	r := gin.Default()
 
-	// Initializations
-	dClient := dgroup.NewClient()
+	// نوٹ: اب ہم یہاں گلوبل dClient نہیں بنائیں گے
+	// کیونکہ ہر ریکوئسٹ کا یوزر نیم اور پاسورڈ الگ ہوگا۔
 
-	// ... (Previous Routes D-Group, NumberPanel, Neon) ...
-	// (Mai purane routes dobara likh k lambi nahi kar raha, wo wese hi rahengy)
-	
-	// ----- SIRF YE WALE ADD KARNE HAIN (Previous routes k neechay) -----
+	// ... (Previous Routes D-Group, NumberPanel, Neon if any) ...
 
 	// ================= D-GROUP ROUTES =================
+
+	// 1. SMS Logs Route
 	r.GET("/d-group/sms", func(c *gin.Context) {
-		data, err := dClient.GetSMSLogs()
+		// URL سے یوزر نیم اور پاسورڈ اٹھائیں (?u=...&p=...)
+		username := c.Query("u")
+		password := c.Query("p")
+
+		// چیک کریں کہ لنک میں پاسورڈ موجود ہے یا نہیں
+		if username == "" || password == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Missing 'u' (username) or 'p' (password) in URL"})
+			return
+		}
+
+		// یہاں نیا کلائنٹ بنائیں اسی یوزر کے لیے
+		client := dgroup.NewClient(username, password)
+
+		data, err := client.GetSMSLogs()
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
@@ -30,8 +42,21 @@ func main() {
 		c.Data(http.StatusOK, "application/json", data)
 	})
 
+	// 2. Number Stats Route
 	r.GET("/d-group/numbers", func(c *gin.Context) {
-		data, err := dClient.GetNumberStats()
+		// URL سے یوزر نیم اور پاسورڈ اٹھائیں
+		username := c.Query("u")
+		password := c.Query("p")
+
+		if username == "" || password == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Missing 'u' (username) or 'p' (password) in URL"})
+			return
+		}
+
+		// یہاں نیا کلائنٹ بنائیں
+		client := dgroup.NewClient(username, password)
+
+		data, err := client.GetNumberStats()
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
