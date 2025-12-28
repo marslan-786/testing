@@ -42,15 +42,20 @@ type Client struct {
 	HTTPClient *http.Client
 	SessKey    string
 	Mutex      sync.Mutex
+	Username   string // Dynamic Username
+	Password   string // Dynamic Password
 }
 
-func NewClient() *Client {
+// NewClient now accepts username and password
+func NewClient(username, password string) *Client {
 	jar, _ := cookiejar.New(nil)
 	return &Client{
 		HTTPClient: &http.Client{
 			Jar:     jar,
 			Timeout: 60 * time.Second,
 		},
+		Username: username,
+		Password: password,
 	}
 }
 
@@ -85,10 +90,10 @@ func (c *Client) performLogin() error {
 	captchaAns := strconv.Itoa(n1 + n2)
 	fmt.Printf("[D-Group] Captcha Solved: %s\n", captchaAns)
 
-	// Login Post
+	// Login Post using Dynamic Credentials
 	data := url.Values{}
-	data.Set("username", "Kami526")
-	data.Set("password", "Kamran5.")
+	data.Set("username", c.Username) // Uses the username passed in NewClient
+	data.Set("password", c.Password) // Uses the password passed in NewClient
 	data.Set("capt", captchaAns)
 
 	loginReq, _ := http.NewRequest("POST", SigninURL, bytes.NewBufferString(data.Encode()))
@@ -117,7 +122,7 @@ func (c *Client) performLogin() error {
 		c.SessKey = sessMatch[1]
 		fmt.Println("[D-Group] Found SessKey:", c.SessKey)
 	} else {
-		return errors.New("sesskey not found")
+		return errors.New("sesskey not found or login failed")
 	}
 
 	return nil
@@ -304,7 +309,6 @@ func processNumbersWithCountry(rawJSON []byte) ([]byte, error) {
 }
 
 // Helper to map Region Codes (ISO 2 char) to Full Names
-// Adding major countries relevant to OTP panels. Add more if needed.
 func getCountryName(code string) string {
 	code = strings.ToUpper(code)
 	countries := map[string]string{
