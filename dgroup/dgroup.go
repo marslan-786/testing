@@ -27,7 +27,7 @@ const (
 	SigninURL    = BaseURL + "/ints/signin"
 	ReportsPage  = BaseURL + "/ints/agent/SMSCDRReports"
 	SMSApiURL    = BaseURL + "/ints/agent/res/data_smscdr.php"
-	NumberApiURL = BaseURL + "/ints/agent/res/data_smsnumberstats.php" // Stats API
+	NumberApiURL = BaseURL + "/ints/agent/res/data_smsnumberstats.php"
 )
 
 // Wrapper for JSON Response
@@ -42,14 +42,33 @@ type Client struct {
 	HTTPClient *http.Client
 	SessKey    string
 	Mutex      sync.Mutex
-	Username   string // Dynamic Username
-	Password   string // Dynamic Password
+	Username   string
+	Password   string
 }
 
-// NewClient now accepts username and password
-func NewClient(username, password string) *Client {
+// ---------------------------------------------------------
+// GLOBAL SESSION STORE (To avoid re-login on every request)
+// ---------------------------------------------------------
+var (
+	sessionStore = make(map[string]*Client)
+	storeMutex   sync.Mutex
+)
+
+// GetSession: Checks if user is already logged in, returns existing client or creates new one.
+func GetSession(username, password string) *Client {
+	storeMutex.Lock()
+	defer storeMutex.Unlock()
+
+	// 1. Check if client exists in memory
+	if client, exists := sessionStore[username]; exists {
+		// Update password if changed (just in case)
+		client.Password = password
+		return client
+	}
+
+	// 2. Create new client if not exists
 	jar, _ := cookiejar.New(nil)
-	return &Client{
+	newClient := &Client{
 		HTTPClient: &http.Client{
 			Jar:     jar,
 			Timeout: 60 * time.Second,
@@ -57,9 +76,18 @@ func NewClient(username, password string) *Client {
 		Username: username,
 		Password: password,
 	}
+
+	// Save to store
+	sessionStore[username] = newClient
+	return newClient
 }
 
+// ---------------------------------------------------------
+// LOGIN & SESSION MANAGEMENT
+// ---------------------------------------------------------
+
 func (c *Client) ensureSession() error {
+	// If SessKey exists, skip login
 	if c.SessKey != "" {
 		return nil
 	}
@@ -67,7 +95,8 @@ func (c *Client) ensureSession() error {
 }
 
 func (c *Client) performLogin() error {
-	fmt.Println("[D-Group] >> Step 1: Login Page")
+	fmt.Printf("[D-Group] >> Performing FRESH Login for User: %s\n", c.Username)
+
 	req, _ := http.NewRequest("GET", LoginURL, nil)
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Linux; Android 10; K)")
 
@@ -79,7 +108,7 @@ func (c *Client) performLogin() error {
 	bodyBytes, _ := io.ReadAll(resp.Body)
 	bodyString := string(bodyBytes)
 
-	// Captcha: 7 + 4 = ?
+	// Captcha Logic
 	re := regexp.MustCompile(`What is (\d+) \+ (\d+) = \?`)
 	matches := re.FindStringSubmatch(bodyString)
 	if len(matches) < 3 {
@@ -90,10 +119,10 @@ func (c *Client) performLogin() error {
 	captchaAns := strconv.Itoa(n1 + n2)
 	fmt.Printf("[D-Group] Captcha Solved: %s\n", captchaAns)
 
-	// Login Post using Dynamic Credentials
+	// Login Post
 	data := url.Values{}
-	data.Set("username", c.Username) // Uses the username passed in NewClient
-	data.Set("password", c.Password) // Uses the password passed in NewClient
+	data.Set("username", c.Username)
+	data.Set("password", c.Password)
 	data.Set("capt", captchaAns)
 
 	loginReq, _ := http.NewRequest("POST", SigninURL, bytes.NewBufferString(data.Encode()))
@@ -105,7 +134,7 @@ func (c *Client) performLogin() error {
 	}
 	defer resp.Body.Close()
 
-	// Get SessKey
+	// Extract SessKey
 	reportReq, _ := http.NewRequest("GET", ReportsPage, nil)
 	reportReq.Header.Set("User-Agent", "Mozilla/5.0 (Linux; Android 10; K)")
 	resp, err = c.HTTPClient.Do(reportReq)
@@ -114,26 +143,29 @@ func (c *Client) performLogin() error {
 	}
 	defer resp.Body.Close()
 	rBody, _ := io.ReadAll(resp.Body)
-	
+
 	sessRe := regexp.MustCompile(`sesskey=([a-zA-Z0-9%=]+)`)
 	sessMatch := sessRe.FindStringSubmatch(string(rBody))
-	
+
 	if len(sessMatch) > 1 {
 		c.SessKey = sessMatch[1]
-		fmt.Println("[D-Group] Found SessKey:", c.SessKey)
+		fmt.Println("[D-Group] Login Success! SessKey Saved:", c.SessKey)
 	} else {
-		return errors.New("sesskey not found or login failed")
+		return errors.New("sesskey not found / login failed")
 	}
 
 	return nil
 }
 
-// ---------------------- SMS LOGIC (Removing User) ----------------------
+// ---------------------------------------------------------
+// SMS LOGIC (User Removed)
+// ---------------------------------------------------------
 
 func (c *Client) GetSMSLogs() ([]byte, error) {
 	c.Mutex.Lock()
 	defer c.Mutex.Unlock()
 
+	// Retry loop: If session expired, it logs in again automatically
 	for i := 0; i < 2; i++ {
 		if err := c.ensureSession(); err != nil {
 			return nil, err
@@ -142,7 +174,7 @@ func (c *Client) GetSMSLogs() ([]byte, error) {
 		now := time.Now()
 		// Start Date: 1st of Current Month
 		startDate := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location())
-		
+
 		params := url.Values{}
 		params.Set("fdate1", startDate.Format("2006-01-02")+" 00:00:00")
 		params.Set("fdate2", now.Format("2006-01-02")+" 23:59:59")
@@ -163,7 +195,9 @@ func (c *Client) GetSMSLogs() ([]byte, error) {
 		defer resp.Body.Close()
 		body, _ := io.ReadAll(resp.Body)
 
+		// Check session expiry
 		if bytes.Contains(body, []byte("<!DOCTYPE html>")) {
+			fmt.Println("[D-Group] Session Expired. Clearing Key & Retrying...")
 			c.SessKey = ""
 			c.HTTPClient.Jar, _ = cookiejar.New(nil)
 			continue
@@ -187,7 +221,7 @@ func cleanDGroupSMS(rawJSON []byte) ([]byte, error) {
 		if len(row) > 5 {
 			msg, _ := row[5].(string)
 			msg = html.UnescapeString(msg)
-			msg = strings.ReplaceAll(msg, "null", "") // Clean explicit null text
+			msg = strings.ReplaceAll(msg, "null", "")
 
 			newRow := []interface{}{
 				row[0], // Date
@@ -195,7 +229,7 @@ func cleanDGroupSMS(rawJSON []byte) ([]byte, error) {
 				row[2], // Number
 				row[3], // Service
 				// Skipped Index 4 (User)
-				msg,    // Message (Moved Up)
+				msg,    // Message
 				row[6], // Currency
 				row[7], // Cost
 				row[8], // Status
@@ -207,13 +241,16 @@ func cleanDGroupSMS(rawJSON []byte) ([]byte, error) {
 	return json.Marshal(apiResp)
 }
 
-// ---------------------- NUMBERS LOGIC (Adding Country & Prefix) ----------------------
+// ---------------------------------------------------------
+// NUMBERS LOGIC (With Country Detection)
+// ---------------------------------------------------------
 
 func (c *Client) GetNumberStats() ([]byte, error) {
 	c.Mutex.Lock()
 	defer c.Mutex.Unlock()
 
 	for i := 0; i < 2; i++ {
+		// Uses the same saved session
 		if err := c.ensureSession(); err != nil {
 			return nil, err
 		}
@@ -237,6 +274,7 @@ func (c *Client) GetNumberStats() ([]byte, error) {
 		body, _ := io.ReadAll(resp.Body)
 
 		if bytes.Contains(body, []byte("<!DOCTYPE html>")) {
+			fmt.Println("[D-Group] Session Expired on Numbers. Retrying...")
 			c.SessKey = ""
 			c.HTTPClient.Jar, _ = cookiejar.New(nil)
 			continue
@@ -256,8 +294,6 @@ func processNumbersWithCountry(rawJSON []byte) ([]byte, error) {
 	var processedRows [][]interface{}
 
 	for _, row := range apiResp.AAData {
-		// D-Group Raw: [Number(0), Count(1), Currency(2), Price(3), Status(4)]
-		// Target: [CountryName, Prefix, Number, Count, Currency, Price, Status]
 		if len(row) > 0 {
 			fullNumStr, ok := row[0].(string)
 			if !ok {
@@ -268,7 +304,6 @@ func processNumbersWithCountry(rawJSON []byte) ([]byte, error) {
 			countryName := "Unknown"
 			countryPrefix := ""
 
-			// Add '+' if missing for parsing
 			parseNumStr := fullNumStr
 			if !strings.HasPrefix(parseNumStr, "+") {
 				parseNumStr = "+" + parseNumStr
@@ -276,39 +311,34 @@ func processNumbersWithCountry(rawJSON []byte) ([]byte, error) {
 
 			numObj, err := phonenumbers.Parse(parseNumStr, "")
 			if err == nil {
-				// Get Country Code (Prefix) e.g. 58
 				countryPrefix = strconv.Itoa(int(numObj.GetCountryCode()))
-				
-				// Get Region Code e.g. "VE"
 				regionCode := phonenumbers.GetRegionCodeForNumber(numObj)
-				
-				// Convert "VE" to "Venezuela"
 				countryName = getCountryName(regionCode)
 			}
 
-			// New Row Construction
 			newRow := []interface{}{
-				countryName,   // 0: Country Name (New)
-				countryPrefix, // 1: Country Code (New)
-				fullNumStr,    // 2: Full Number
-				row[1],        // 3: Count
-				row[2],        // 4: Currency
-				row[3],        // 5: Price
-				row[4],        // 6: Status
+				countryName,   // 0
+				countryPrefix, // 1
+				fullNumStr,    // 2
+				row[1],        // 3
+				row[2],        // 4
+				row[3],        // 5
+				row[4],        // 6
 			}
 			processedRows = append(processedRows, newRow)
 		}
 	}
 
 	apiResp.AAData = processedRows
-	// Update total records count just in case
 	apiResp.ITotalRecords = len(processedRows)
 	apiResp.ITotalDisplayRecords = len(processedRows)
 
 	return json.Marshal(apiResp)
 }
 
-// Helper to map Region Codes (ISO 2 char) to Full Names
+// ---------------------------------------------------------
+// FULL COUNTRY LIST (As Requested)
+// ---------------------------------------------------------
 func getCountryName(code string) string {
 	code = strings.ToUpper(code)
 	countries := map[string]string{
@@ -338,5 +368,5 @@ func getCountryName(code string) string {
 	if name, ok := countries[code]; ok {
 		return name
 	}
-	return code // Return code (e.g. VE) if full name not found
+	return code
 }
