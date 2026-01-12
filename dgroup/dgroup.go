@@ -258,7 +258,7 @@ func (c *Client) GetNumberStats() ([]byte, error) {
 		now := time.Now()
 		params := url.Values{}
 		params.Set("fdate1", now.Format("2006-01-02")+" 00:00:00")
-		params.Set("fdate2", now.Format("2006-12-02")+" 23:59:59")
+		params.Set("fdate2", now.Format("2006-01-02")+" 23:59:59")
 		params.Set("sEcho", "2")
 		params.Set("iDisplayLength", "-1")
 
