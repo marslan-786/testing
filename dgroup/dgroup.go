@@ -16,7 +16,6 @@ import (
 	"sync"
 	"time"
 
-	// Google's libphonenumber library for Go
 	"github.com/nyaruka/phonenumbers"
 )
 
@@ -27,7 +26,7 @@ const (
 	SigninURL    = BaseURL + "/ints/signin"
 	ReportsPage  = BaseURL + "/ints/agent/SMSCDRReports"
 	SMSApiURL    = BaseURL + "/ints/agent/res/data_smscdr.php"
-	NumberApiURL = BaseURL + "/ints/agent/res/data_smsnumberstats.php" // Stats API
+	NumberApiURL = BaseURL + "/ints/agent/res/data_smsnumberstats.php"
 )
 
 // Wrapper for JSON Response
@@ -42,11 +41,40 @@ type Client struct {
 	HTTPClient *http.Client
 	SessKey    string
 	Mutex      sync.Mutex
-	Username   string // Dynamic Username
-	Password   string // Dynamic Password
+	Username   string
+	Password   string
 }
 
-// NewClient now accepts username and password
+// ---------------------------------------------------------
+// SESSION MANAGER (Added back for your main.go)
+// ---------------------------------------------------------
+
+var (
+	// یہ میپ سب یوزرز کے سیشنز کو یاد رکھے گا
+	sessionStore = make(map[string]*Client)
+	storeMutex   sync.Mutex
+)
+
+// GetSession: یہ فنکشن چیک کرے گا کہ یوزر پہلے سے موجود ہے یا نہیں
+func GetSession(username, password string) *Client {
+	storeMutex.Lock()
+	defer storeMutex.Unlock()
+
+	// اگر کلائنٹ پہلے سے موجود ہے تو وہی واپس بھیج دو
+	if client, exists := sessionStore[username]; exists {
+		// پاسورڈ اپڈیٹ کر دو اگر چینج ہوا ہو
+		client.Password = password
+		return client
+	}
+
+	// نیا کلائنٹ بناؤ اور اسٹور میں محفوظ کر لو
+	newClient := NewClient(username, password)
+	sessionStore[username] = newClient
+	return newClient
+}
+
+// ---------------------------------------------------------
+
 func NewClient(username, password string) *Client {
 	jar, _ := cookiejar.New(nil)
 	return &Client{
@@ -67,7 +95,7 @@ func (c *Client) ensureSession() error {
 }
 
 func (c *Client) performLogin() error {
-	fmt.Println("[D-Group] >> Step 1: Login Page")
+	fmt.Printf("[D-Group] >> Login Attempt for User: %s\n", c.Username)
 	req, _ := http.NewRequest("GET", LoginURL, nil)
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Linux; Android 10; K)")
 
@@ -79,7 +107,6 @@ func (c *Client) performLogin() error {
 	bodyBytes, _ := io.ReadAll(resp.Body)
 	bodyString := string(bodyBytes)
 
-	// Captcha: 7 + 4 = ?
 	re := regexp.MustCompile(`What is (\d+) \+ (\d+) = \?`)
 	matches := re.FindStringSubmatch(bodyString)
 	if len(matches) < 3 {
@@ -88,12 +115,10 @@ func (c *Client) performLogin() error {
 	n1, _ := strconv.Atoi(matches[1])
 	n2, _ := strconv.Atoi(matches[2])
 	captchaAns := strconv.Itoa(n1 + n2)
-	fmt.Printf("[D-Group] Captcha Solved: %s\n", captchaAns)
 
-	// Login Post using Dynamic Credentials
 	data := url.Values{}
-	data.Set("username", c.Username) // Uses the username passed in NewClient
-	data.Set("password", c.Password) // Uses the password passed in NewClient
+	data.Set("username", c.Username)
+	data.Set("password", c.Password)
 	data.Set("capt", captchaAns)
 
 	loginReq, _ := http.NewRequest("POST", SigninURL, bytes.NewBufferString(data.Encode()))
@@ -105,7 +130,6 @@ func (c *Client) performLogin() error {
 	}
 	defer resp.Body.Close()
 
-	// Get SessKey
 	reportReq, _ := http.NewRequest("GET", ReportsPage, nil)
 	reportReq.Header.Set("User-Agent", "Mozilla/5.0 (Linux; Android 10; K)")
 	resp, err = c.HTTPClient.Do(reportReq)
@@ -114,13 +138,13 @@ func (c *Client) performLogin() error {
 	}
 	defer resp.Body.Close()
 	rBody, _ := io.ReadAll(resp.Body)
-	
+
 	sessRe := regexp.MustCompile(`sesskey=([a-zA-Z0-9%=]+)`)
 	sessMatch := sessRe.FindStringSubmatch(string(rBody))
-	
+
 	if len(sessMatch) > 1 {
 		c.SessKey = sessMatch[1]
-		fmt.Println("[D-Group] Found SessKey:", c.SessKey)
+		fmt.Println("[D-Group] Login Success. SessKey Found.")
 	} else {
 		return errors.New("sesskey not found or login failed")
 	}
@@ -128,7 +152,7 @@ func (c *Client) performLogin() error {
 	return nil
 }
 
-// ---------------------- SMS LOGIC (Removing User) ----------------------
+// ---------------------- SMS LOGIC ----------------------
 
 func (c *Client) GetSMSLogs() ([]byte, error) {
 	c.Mutex.Lock()
@@ -136,13 +160,15 @@ func (c *Client) GetSMSLogs() ([]byte, error) {
 
 	for i := 0; i < 2; i++ {
 		if err := c.ensureSession(); err != nil {
-			return nil, err
+			// اگر لاگ ان فیل ہوا تو سیشن کی خالی کرو تاکہ دوبارہ ٹرائی ہو
+			c.SessKey = "" 
+			continue
 		}
 
 		now := time.Now()
 		// Start Date: 1st of Current Month
 		startDate := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location())
-		
+
 		params := url.Values{}
 		params.Set("fdate1", startDate.Format("2006-01-02")+" 00:00:00")
 		params.Set("fdate2", now.Format("2006-01-02")+" 23:59:59")
@@ -181,24 +207,21 @@ func cleanDGroupSMS(rawJSON []byte) ([]byte, error) {
 	}
 
 	var cleanedRows [][]interface{}
-
-	// D-Group Raw: [Date, Range, Number, Service, User(4), Message(5), Currency, Cost, Status]
 	for _, row := range apiResp.AAData {
 		if len(row) > 5 {
 			msg, _ := row[5].(string)
 			msg = html.UnescapeString(msg)
-			msg = strings.ReplaceAll(msg, "null", "") // Clean explicit null text
+			msg = strings.ReplaceAll(msg, "null", "")
 
 			newRow := []interface{}{
-				row[0], // Date
-				row[1], // Range
-				row[2], // Number
-				row[3], // Service
-				// Skipped Index 4 (User)
-				msg,    // Message (Moved Up)
-				row[6], // Currency
-				row[7], // Cost
-				row[8], // Status
+				row[0],
+				row[1],
+				row[2],
+				row[3],
+				msg,
+				row[6],
+				row[7],
+				row[8],
 			}
 			cleanedRows = append(cleanedRows, newRow)
 		}
@@ -207,11 +230,7 @@ func cleanDGroupSMS(rawJSON []byte) ([]byte, error) {
 	return json.Marshal(apiResp)
 }
 
-// ---------------------- NUMBERS LOGIC (Adding Country & Prefix) ----------------------
-
-// ---------------------- NUMBERS LOGIC (Modified Date Range) ----------------------
-
-// ---------------------- NUMBERS LOGIC (Manual Fixed Start Date) ----------------------
+// ---------------------- NUMBERS LOGIC (With Fixed Start Date) ----------------------
 
 func (c *Client) GetNumberStats() ([]byte, error) {
 	c.Mutex.Lock()
@@ -219,26 +238,18 @@ func (c *Client) GetNumberStats() ([]byte, error) {
 
 	for i := 0; i < 2; i++ {
 		if err := c.ensureSession(); err != nil {
-			return nil, err
+			c.SessKey = ""
+			continue
 		}
 
 		now := time.Now()
 
-		// ---------------------------------------------------------
 		// [CONFIGURATION] Hardcoded Start Date
-		// آپ یہاں اپنی مرضی کی تاریخ لکھ سکتے ہیں (Format: YYYY-MM-DD)
-		// مثال: "2025-01-01" یا "2024-12-15"
-		fixedStartDate := "2025-10-01" 
-		// ---------------------------------------------------------
+		fixedStartDate := "2025-01-01"
 
 		params := url.Values{}
-		
-		// Start Date: جو آپ نے اوپر variable میں دی ہے
 		params.Set("fdate1", fixedStartDate+" 00:00:00")
-		
-		// End Date: آج کا دن (Current Date)
 		params.Set("fdate2", now.Format("2006-01-02")+" 23:59:59")
-		
 		params.Set("sEcho", "2")
 		params.Set("iDisplayLength", "-1")
 
@@ -264,8 +275,6 @@ func (c *Client) GetNumberStats() ([]byte, error) {
 	return nil, errors.New("failed after retry")
 }
 
-
-
 func processNumbersWithCountry(rawJSON []byte) ([]byte, error) {
 	var apiResp ApiResponse
 	if err := json.Unmarshal(rawJSON, &apiResp); err != nil {
@@ -275,19 +284,15 @@ func processNumbersWithCountry(rawJSON []byte) ([]byte, error) {
 	var processedRows [][]interface{}
 
 	for _, row := range apiResp.AAData {
-		// D-Group Raw: [Number(0), Count(1), Currency(2), Price(3), Status(4)]
-		// Target: [CountryName, Prefix, Number, Count, Currency, Price, Status]
 		if len(row) > 0 {
 			fullNumStr, ok := row[0].(string)
 			if !ok {
 				continue
 			}
 
-			// Detect Country & Prefix using Google's Lib
 			countryName := "Unknown"
 			countryPrefix := ""
 
-			// Add '+' if missing for parsing
 			parseNumStr := fullNumStr
 			if !strings.HasPrefix(parseNumStr, "+") {
 				parseNumStr = "+" + parseNumStr
@@ -295,39 +300,31 @@ func processNumbersWithCountry(rawJSON []byte) ([]byte, error) {
 
 			numObj, err := phonenumbers.Parse(parseNumStr, "")
 			if err == nil {
-				// Get Country Code (Prefix) e.g. 58
 				countryPrefix = strconv.Itoa(int(numObj.GetCountryCode()))
-				
-				// Get Region Code e.g. "VE"
 				regionCode := phonenumbers.GetRegionCodeForNumber(numObj)
-				
-				// Convert "VE" to "Venezuela"
 				countryName = getCountryName(regionCode)
 			}
 
-			// New Row Construction
 			newRow := []interface{}{
-				countryName,   // 0: Country Name (New)
-				countryPrefix, // 1: Country Code (New)
-				fullNumStr,    // 2: Full Number
-				row[1],        // 3: Count
-				row[2],        // 4: Currency
-				row[3],        // 5: Price
-				row[4],        // 6: Status
+				countryName,
+				countryPrefix,
+				fullNumStr,
+				row[1],
+				row[2],
+				row[3],
+				row[4],
 			}
 			processedRows = append(processedRows, newRow)
 		}
 	}
 
 	apiResp.AAData = processedRows
-	// Update total records count just in case
 	apiResp.ITotalRecords = len(processedRows)
 	apiResp.ITotalDisplayRecords = len(processedRows)
 
 	return json.Marshal(apiResp)
 }
 
-// Helper to map Region Codes (ISO 2 char) to Full Names
 func getCountryName(code string) string {
 	code = strings.ToUpper(code)
 	countries := map[string]string{
@@ -357,5 +354,5 @@ func getCountryName(code string) string {
 	if name, ok := countries[code]; ok {
 		return name
 	}
-	return code // Return code (e.g. VE) if full name not found
+	return code
 }
